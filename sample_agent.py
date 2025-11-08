@@ -1,154 +1,149 @@
-"""
-Sample agent for Case Closed Challenge - Works with Judge Protocol
-This agent runs as a Flask server and responds to judge requests.
-"""
-
 import os
+import uuid
 from flask import Flask, request, jsonify
+from threading import Lock
 from collections import deque
+from state import parse_state
+from heuristics import choose_by_heuristic, maybe_apply_boost
 
+from case_closed_game import Game, Direction, GameResult
+
+# Flask API server setup
 app = Flask(__name__)
 
-# Basic identity
-PARTICIPANT = os.getenv("PARTICIPANT", "SampleParticipant")
-AGENT_NAME = os.getenv("AGENT_NAME", "SampleAgent")
+GLOBAL_GAME = Game()
+LAST_POSTED_STATE = {}
 
-# Track game state
-game_state = {
-    "board": None,
-    "agent1_trail": [],
-    "agent2_trail": [],
-    "agent1_length": 0,
-    "agent2_length": 0,
-    "agent1_alive": True,
-    "agent2_alive": True,
-    "agent1_boosts": 3,
-    "agent2_boosts": 3,
-    "turn_count": 0,
-    "player_number": 1,
-}
+game_lock = Lock()
+
+PARTICIPANT = "ParticipantX"
+AGENT_NAME = "AgentX"
 
 
 @app.route("/", methods=["GET"])
 def info():
-    """Basic health/info endpoint used by the judge to check connectivity."""
+    """Basic health/info endpoint used by the judge to check connectivity.
+
+    Returns participant and agent_name (so Judge.check_latency can create Agent objects).
+    """
     return jsonify({"participant": PARTICIPANT, "agent_name": AGENT_NAME}), 200
+
+
+def _update_local_game_from_post(data: dict):
+    """Update the local GLOBAL_GAME using the JSON posted by the judge.
+
+    The judge posts a dictionary with keys matching the Judge.send_state payload
+    (board, agent1_trail, agent2_trail, agent1_length, agent2_length, agent1_alive,
+    agent2_alive, agent1_boosts, agent2_boosts, turn_count).
+    """
+    with game_lock:
+        LAST_POSTED_STATE.clear()
+        LAST_POSTED_STATE.update(data)
+
+        if "board" in data:
+            try:
+                GLOBAL_GAME.board.grid = data["board"]
+            except Exception:
+                pass
+
+        if "agent1_trail" in data:
+            GLOBAL_GAME.agent1.trail = deque(tuple(p) for p in data["agent1_trail"])
+        if "agent2_trail" in data:
+            GLOBAL_GAME.agent2.trail = deque(tuple(p) for p in data["agent2_trail"])
+        if "agent1_length" in data:
+            GLOBAL_GAME.agent1.length = int(data["agent1_length"])
+        if "agent2_length" in data:
+            GLOBAL_GAME.agent2.length = int(data["agent2_length"])
+        if "agent1_alive" in data:
+            GLOBAL_GAME.agent1.alive = bool(data["agent1_alive"])
+        if "agent2_alive" in data:
+            GLOBAL_GAME.agent2.alive = bool(data["agent2_alive"])
+        if "agent1_boosts" in data:
+            GLOBAL_GAME.agent1.boosts_remaining = int(data["agent1_boosts"])
+        if "agent2_boosts" in data:
+            GLOBAL_GAME.agent2.boosts_remaining = int(data["agent2_boosts"])
+        if "turn_count" in data:
+            GLOBAL_GAME.turns = int(data["turn_count"])
 
 
 @app.route("/send-state", methods=["POST"])
 def receive_state():
-    """Judge calls this to push the current game state to the agent server."""
+    """Judge calls this to push the current game state to the agent server.
+
+    The agent should update its local representation and return 200.
+    """
     data = request.get_json()
     if not data:
         return jsonify({"error": "no json body"}), 400
-    
-    # Update our local game state
-    game_state.update(data)
-    
+    _update_local_game_from_post(data)
     return jsonify({"status": "state received"}), 200
 
 
 @app.route("/send-move", methods=["GET"])
 def send_move():
     """Judge calls this (GET) to request the agent's move for the current tick.
-    
+
+    Query params the judge sends (optional): player_number, attempt_number,
+    random_moves_left, turn_count. Agents can use this to decide.
+
     Return format: {"move": "DIRECTION"} or {"move": "DIRECTION:BOOST"}
+    where DIRECTION is UP, DOWN, LEFT, or RIGHT
+    and :BOOST is optional to use a speed boost (move twice)
     """
     player_number = request.args.get("player_number", default=1, type=int)
-    turn_count = game_state.get("turn_count", 0)
-    
-    # Get our current state
-    if player_number == 1:
-        my_trail = game_state.get("agent1_trail", [])
-        my_boosts = game_state.get("agent1_boosts", 3)
-        other_trail = game_state.get("agent2_trail", [])
-    else:
-        my_trail = game_state.get("agent2_trail", [])
-        my_boosts = game_state.get("agent2_boosts", 3)
-        other_trail = game_state.get("agent1_trail", [])
-    
-    # Simple decision logic
-    move = decide_move(my_trail, other_trail, turn_count, my_boosts)
-    
+
+    with game_lock:
+        state = dict(LAST_POSTED_STATE)
+        my_agent = GLOBAL_GAME.agent1 if player_number == 1 else GLOBAL_GAME.agent2
+        boosts_remaining = my_agent.boosts_remaining
+
+    # -----------------your code here-------------------
+    # Simple example: always go RIGHT (replace this with your logic)
+    # To use a boost: move = "RIGHT:BOOST"
+    move = "RIGHT"
+    # Copy the last posted payload safely (outside the lock now)
+    payload = dict(state)
+
+    # Decide which side we are this tick
+    role = "agent1" if player_number == 1 else "agent2"
+
+    # Parse into our State object
+    s = parse_state(payload, role=role)
+
+    # Heuristic choice: "UP" / "DOWN" / "LEFT" / "RIGHT"
+    base_move = choose_by_heuristic(s)
+    move = maybe_apply_boost(s, base_move, threshold=8)
+
+    # Example: Use boost if available and it's late in the game
+    # turn_count = state.get("turn_count", 0)
+    # if boosts_remaining > 0 and turn_count > 50:
+    #     move = "RIGHT:BOOST"
+    # -----------------end code here--------------------
+
     return jsonify({"move": move}), 200
+
+def choose_move(s):
+    """
+    Single entrypoint your agent uses each tick.
+    Heuristic-only first; BOOST policy can be toggled inside maybe_apply_boost.
+    """
+    base_move = choose_by_heuristic(s)          # "UP"/"DOWN"/"LEFT"/"RIGHT"
+    final_move = maybe_apply_boost(s, base_move)  # returns "DIR" or "DIR:BOOST"
+    return final_move
 
 
 @app.route("/end", methods=["POST"])
 def end_game():
-    """Judge notifies agent that the match finished and provides final state."""
+    """Judge notifies agent that the match finished and provides final state.
+
+    We update local state for record-keeping and return OK.
+    """
     data = request.get_json()
     if data:
-        result = data.get("result", "UNKNOWN")
-        print(f"\nGame Over! Result: {result}")
+        _update_local_game_from_post(data)
     return jsonify({"status": "acknowledged"}), 200
 
 
-def decide_move(my_trail, other_trail, turn_count, my_boosts):
-    """Simple decision logic for the agent.
-    
-    Strategy:
-    - Move in a direction that doesn't immediately hit a trail
-    - Use boost if we have them and it's mid-game (turns 30-80)
-    """
-    if not my_trail:
-        return "RIGHT"
-    
-    # Get current head position and direction
-    head = my_trail[-1] if my_trail else (0, 0)
-    
-    # Calculate current direction if we have at least 2 positions
-    current_dir = "RIGHT"
-    if len(my_trail) >= 2:
-        prev = my_trail[-2]
-        dx = head[0] - prev[0]
-        dy = head[1] - prev[1]
-        
-        # Normalize for torus wrapping
-        if abs(dx) > 1:
-            dx = -1 if dx > 0 else 1
-        if abs(dy) > 1:
-            dy = -1 if dy > 0 else 1
-        
-        if dx == 1:
-            current_dir = "RIGHT"
-        elif dx == -1:
-            current_dir = "LEFT"
-        elif dy == 1:
-            current_dir = "DOWN"
-        elif dy == -1:
-            current_dir = "UP"
-    
-    # Simple strategy: try to avoid trails, prefer continuing straight
-    # Check available directions (not opposite to current)
-    directions = ["UP", "DOWN", "LEFT", "RIGHT"]
-    opposite = {"UP": "DOWN", "DOWN": "UP", "LEFT": "RIGHT", "RIGHT": "LEFT"}
-    
-    # Remove opposite direction
-    if current_dir in opposite:
-        try:
-            directions.remove(opposite[current_dir])
-        except ValueError:
-            pass
-    
-    # Prefer current direction if still available
-    if current_dir in directions:
-        chosen_dir = current_dir
-    else:
-        # Pick first available
-        chosen_dir = directions[0] if directions else "RIGHT"
-    
-    # Decide whether to use boost
-    # Use boost in mid-game when we still have them
-    use_boost = my_boosts > 0 and 30 <= turn_count <= 80
-    
-    if use_boost:
-        return f"{chosen_dir}:BOOST"
-    else:
-        return chosen_dir
-
-
 if __name__ == "__main__":
-    # For development only. Port can be overridden with the PORT env var.
-    port = int(os.environ.get("PORT", "5009"))
-    print(f"Starting {AGENT_NAME} ({PARTICIPANT}) on port {port}...")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    port = int(os.environ.get("PORT", "5008"))
+    app.run(host="0.0.0.0", port=port, debug=True)

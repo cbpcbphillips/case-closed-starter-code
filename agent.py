@@ -3,6 +3,8 @@ import uuid
 from flask import Flask, request, jsonify
 from threading import Lock
 from collections import deque
+from state import parse_state
+from heuristics import choose_by_heuristic, maybe_apply_boost
 
 from case_closed_game import Game, Direction, GameResult
 
@@ -99,7 +101,19 @@ def send_move():
     # Simple example: always go RIGHT (replace this with your logic)
     # To use a boost: move = "RIGHT:BOOST"
     move = "RIGHT"
-    
+    # Copy the last posted payload safely (outside the lock now)
+    payload = dict(state)
+
+    # Decide which side we are this tick
+    role = "agent1" if player_number == 1 else "agent2"
+
+    # Parse into our State object
+    s = parse_state(payload, role=role)
+
+    # Heuristic choice: "UP" / "DOWN" / "LEFT" / "RIGHT"
+    base_move = choose_by_heuristic(s)
+    move = maybe_apply_boost(s, base_move, threshold=8)
+
     # Example: Use boost if available and it's late in the game
     # turn_count = state.get("turn_count", 0)
     # if boosts_remaining > 0 and turn_count > 50:
@@ -107,6 +121,15 @@ def send_move():
     # -----------------end code here--------------------
 
     return jsonify({"move": move}), 200
+
+def choose_move(s):
+    """
+    Single entrypoint your agent uses each tick.
+    Heuristic-only first; BOOST policy can be toggled inside maybe_apply_boost.
+    """
+    base_move = choose_by_heuristic(s)          # "UP"/"DOWN"/"LEFT"/"RIGHT"
+    final_move = maybe_apply_boost(s, base_move)  # returns "DIR" or "DIR:BOOST"
+    return final_move
 
 
 @app.route("/end", methods=["POST"])
