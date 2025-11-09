@@ -1,6 +1,5 @@
 # state.py
 from dataclasses import dataclass
-from collections import deque
 from typing import Tuple, List, Optional, Literal, Dict
 import numpy as np
 
@@ -15,6 +14,7 @@ DIR_VEC = {
 }
 
 DIRS: List[Dir] = ["UP", "LEFT", "RIGHT", "DOWN"]  # deterministic order
+
 
 @dataclass(frozen=True)
 class State:
@@ -36,6 +36,7 @@ class State:
     opp_last_dir: Optional[Dir]
     role: Literal["agent1", "agent2"]
 
+    # ---------- geometry helpers ----------
     def wrap(self, r: int, c: int) -> Tuple[int, int]:
         return (r % self.H, c % self.W)
 
@@ -59,6 +60,90 @@ class State:
 
     def legal_dirs_opp(self) -> List[Dir]:
         return self.legal_dirs_from(self.opp_head)
+
+    # ---------- simulation helpers used by heuristics/search ----------
+    def after_me(self, move: Dir) -> "State":
+        return self._after_generic(move, who="me", boost=False)
+
+    def after_opp(self, move: Dir) -> "State":
+        return self._after_generic(move, who="opp", boost=False)
+
+    def after_me_boost(self, move: Dir) -> "State":
+        return self._after_generic(move, who="me", boost=True)
+
+    def _after_generic(self, move: Dir, who: Literal["me","opp"], boost: bool) -> "State":
+        # validate move
+        if move not in ("UP", "DOWN", "LEFT", "RIGHT"):
+            return self  # return unchanged if nonsense
+
+        board = self.board.copy()
+        me_head, opp_head = self.me_head, self.opp_head
+        me_trail = list(self.me_trail)
+        opp_trail = list(self.opp_trail)
+
+        steps = 2 if boost else 1
+        head = me_head if who == "me" else opp_head
+        trail = me_trail if who == "me" else opp_trail
+
+        alive_me  = self.me_alive
+        alive_opp = self.opp_alive
+
+        for _ in range(steps):
+            head = self.next_pos(head, move)
+            r, c = head
+
+            # collision with any wall/trail
+            if board[r, c] != 0:
+                if who == "me":
+                    alive_me = False
+                    me_head = head
+                    me_trail = tuple(me_trail + [head])
+                else:
+                    alive_opp = False
+                    opp_head = head
+                    opp_trail = tuple(opp_trail + [head])
+                return State(
+                    board=board, H=self.H, W=self.W,
+                    me_head=me_head if who=="opp" else head,
+                    opp_head=opp_head if who=="me" else head,
+                    me_trail=tuple(me_trail) if who=="opp" else tuple(trail + [head]),
+                    opp_trail=tuple(opp_trail) if who=="me" else tuple(trail + [head]),
+                    me_len=self.me_len + (1 if who=="me" else 0),
+                    opp_len=self.opp_len + (1 if who=="opp" else 0),
+                    me_alive=alive_me, opp_alive=alive_opp,
+                    me_boosts=self.me_boosts - (1 if who=="me" and boost else 0),
+                    opp_boosts=self.opp_boosts - (1 if who=="opp" and boost else 0),
+                    turn=self.turn + 1,
+                    me_last_dir=move if who=="me" else self.me_last_dir,
+                    opp_last_dir=move if who=="opp" else self.opp_last_dir,
+                    role=self.role
+                )
+
+            # normal step: stamp and grow
+            board[r, c] = 1
+            trail.append(head)
+
+        # commit head/trail after all steps
+        if who == "me":
+            me_head, me_trail = head, trail
+        else:
+            opp_head, opp_trail = head, trail
+
+        return State(
+            board=board, H=self.H, W=self.W,
+            me_head=me_head, opp_head=opp_head,
+            me_trail=tuple(me_trail), opp_trail=tuple(opp_trail),
+            me_len=self.me_len + (2 if (who=="me" and boost) else (1 if who=="me" else 0)),
+            opp_len=self.opp_len + (2 if (who=="opp" and boost) else (1 if who=="opp" else 0)),
+            me_alive=alive_me, opp_alive=alive_opp,
+            me_boosts=self.me_boosts - (1 if who=="me" and boost else 0),
+            opp_boosts=self.opp_boosts - (1 if who=="opp" and boost else 0),
+            turn=self.turn + 1,
+            me_last_dir=move if who=="me" else self.me_last_dir,
+            opp_last_dir=move if who=="opp" else self.opp_last_dir,
+            role=self.role
+        )
+
 
 # ---------- internal utils ----------
 

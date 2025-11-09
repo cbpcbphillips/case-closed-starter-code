@@ -1,0 +1,44 @@
+{
+  "PARTICIPANT": "ParticipantX",
+  "AGENT_NAME": "AgentX",
+  "AGENT_VARIANT": "champion-A",
+
+  "W_VORONOI": 0.50,
+  "W_SPACE": 0.20,
+  "W_BRANCH": 0.05,
+  "W_OPP_REACH": 0.20,
+  "W_TRAP": 0.15,
+  "W_CENTER": 0.02,
+
+  "W_TUNNEL": 0.12,
+  "W_SPLIT": 0.70,
+  "W_CONTEST": 0.40,
+  "W_JUNCTION": 0.05,
+
+  "W_POCKET": 0.35,
+  "W_CUTPOINT": 0.25,
+  "W_FRONTIER_SAFE": 0.20,
+  "W_HEADON_WIN": 0.60,
+  "W_HEADON_LOSS": 0.90,
+  "W_REP_BREAK": 0.0025,
+
+  "MAX_TUNNEL_PROBE": 8,
+  "CONTEST_CAP": 6,
+  "JUNCTION_CAP": 10,
+  "POCKET_CAP": 18,
+  "FRONTIER_DEPTH": 2,
+  "CUT_LOCAL_RADIUS": 3,
+  "DEADEND_CAP": 8,
+
+  "TIE_NOISE": 0.001,
+  "OPENING_TURNS": 3,
+  "QUIESCENCE_ENABLE": 1,
+  "QUIESCENCE_MARGIN": 0.06,
+
+  "BOOST_VORONOI_DELTA": 0.05,
+
+  "LOG_FILE": "tools/out/rollouts.jsonl",
+  "POLICY_WEIGHTS": "tools/out/policy_weights.json",
+  "ENABLE_POLICY_HEAD": 1,
+  "CHAMPION_TAG": "2025-11-09"
+}

@@ -1,149 +1,178 @@
-import os
-import uuid
+#!/usr/bin/env python3
+import os, json, random
+from datetime import datetime
 from flask import Flask, request, jsonify
-from threading import Lock
-from collections import deque
+
+from config import cfg
 from state import parse_state
 from heuristics import choose_by_heuristic, maybe_apply_boost
 
-from case_closed_game import Game, Direction, GameResult
+try:
+    from case_closed_game import Direction
+    HAS_DIRECTION = True
+except Exception:
+    HAS_DIRECTION = False
 
-# Flask API server setup
+# --------------------------------------------------------------------------
+# Champion / env config
+# --------------------------------------------------------------------------
+PARTICIPANT   = os.environ.get("PARTICIPANT",   str(cfg("PARTICIPANT", "ParticipantX")))
+AGENT_NAME    = os.environ.get("AGENT_NAME",    str(cfg("AGENT_NAME", "AgentX")))
+AGENT_VARIANT = os.environ.get("AGENT_VARIANT", str(cfg("AGENT_VARIANT", "A")))
+PORT          = int(os.environ.get("PORT", str(os.environ.get("PORT") or 5008)))
+
+LOG_FILE      = os.environ.get("LOG_FILE", str(cfg("LOG_FILE", ""))).strip()
+POLICY_PATH   = os.environ.get("POLICY_WEIGHTS", str(cfg("POLICY_WEIGHTS", ""))).strip()
+ENABLE_POLICY = int(os.environ.get("ENABLE_POLICY_HEAD", str(cfg("ENABLE_POLICY_HEAD", 1))))
+
 app = Flask(__name__)
 
-GLOBAL_GAME = Game()
-LAST_POSTED_STATE = {}
+_POLICY = None
+_POLICY_META = None
 
-game_lock = Lock()
- 
-PARTICIPANT = "ParticipantX"
-AGENT_NAME = "AgentX"
+def _try_load_policy():
+    global _POLICY, _POLICY_META
+    if _POLICY is not None or not POLICY_PATH or not ENABLE_POLICY:
+        return
+    try:
+        with open(POLICY_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        W = data.get("W")
+        if isinstance(W, list) and W and isinstance(W[0], list):
+            _POLICY = W
+            _POLICY_META = {
+                "actions": data.get("actions", ["UP","DOWN","LEFT","RIGHT"]),
+                "dim": data.get("dim", len(W[0]))
+            }
+    except Exception:
+        _POLICY = None
+        _POLICY_META = None
 
+def _safe_jsonl(path, record):
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
+def _feature_vector_from_state(s, last_move_hint="UP"):
+    try:
+        r, c = s.me_head
+        center_r, center_c = (s.H - 1)/2.0, (s.W - 1)/2.0
+        my_len  = float(s.me_len)  / 120.0
+        opp_len = float(s.opp_len) / 120.0
+        boosts  = float(s.me_boosts) / 5.0
+        dr = (r - center_r) / max(1.0, s.H/2.0)
+        dc = (c - center_c) / max(1.0, s.W/2.0)
+        actions = ["UP","DOWN","LEFT","RIGHT"]
+        last = last_move_hint if last_move_hint in actions else (s.me_last_dir or "UP")
+        last_oh = [1.0 if last == a else 0.0 for a in actions]
+        return [1.0, my_len, opp_len, boosts, dr, dc, *last_oh]
+    except Exception:
+        return [1.0] + [0.0]*9
+
+def _policy_argmax(legal_moves, features):
+    if _POLICY is None or _POLICY_META is None:
+        return None
+    try:
+        actions = _POLICY_META.get("actions", ["UP","DOWN","LEFT","RIGHT"])
+        def dot(a, b): return sum(x*y for x, y in zip(a, b))
+        logits = [dot(row, features) for row in _POLICY]
+        NEG_INF = -1e9
+        masked = [logits[i] if a in legal_moves else NEG_INF for i, a in enumerate(actions)]
+        idx = max(range(len(masked)), key=lambda k: masked[k])
+        return actions[idx]
+    except Exception:
+        return None
+
+def _legal_from_payload(p):
+    legal = p.get("legal_moves") or p.get("legalMoves") or ["UP","DOWN","LEFT","RIGHT"]
+    return [str(m).upper() for m in legal]
+
+# --------------------------------------------------------------------------
+# Core
+# --------------------------------------------------------------------------
+def decide_move(raw_state):
+    s = parse_state(raw_state)
+    legal = _legal_from_payload(raw_state)
+
+    rng = random.Random(hash((getattr(s, "turn", 0), s.me_head, s.opp_head)) & 0xFFFFFFFF)
+    move = choose_by_heuristic(s, rng)
+    if isinstance(move, Direction) and HAS_DIRECTION:
+        move = move.name
+    move = str(move).upper()
+
+    _try_load_policy()
+    if ENABLE_POLICY and _POLICY is not None:
+        feats = _feature_vector_from_state(s, last_move_hint=move)
+        pmove = _policy_argmax(legal, feats)
+        if pmove in legal:
+            move = pmove
+
+    try:
+        move2 = maybe_apply_boost(s, move)
+        if move2:
+            if isinstance(move2, Direction) and HAS_DIRECTION:
+                move2 = move2.name
+            move = str(move2).upper()
+    except Exception:
+        pass
+
+    if move not in legal:
+        move = legal[0]
+
+    return move, s, legal
+
+# --------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def info():
-    """Basic health/info endpoint used by the judge to check connectivity.
+    return jsonify({
+        "participant": PARTICIPANT,
+        "agent_name": AGENT_NAME,
+        "variant": AGENT_VARIANT,
+        "policy_loaded": bool(_POLICY is not None),
+        "champion_tag": cfg("CHAMPION_TAG", "none")
+    }), 200
 
-    Returns participant and agent_name (so Judge.check_latency can create Agent objects).
-    """
-    return jsonify({"participant": PARTICIPANT, "agent_name": AGENT_NAME}), 200
+@app.route("/move", methods=["POST"])
+def move():
+    payload = request.get_json(silent=True) or {}
+    mv, s, legal = decide_move(payload)
 
+    # Minimal but useful rollout log for training
+    rec = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "participant": PARTICIPANT,
+        "agent": AGENT_NAME,
+        "variant": AGENT_VARIANT,
+        "turn": getattr(s, "turn", 0),
+        "H": getattr(s, "H", None),
+        "W": getattr(s, "W", None),
 
-def _update_local_game_from_post(data: dict):
-    """Update the local GLOBAL_GAME using the JSON posted by the judge.
+        "me": {
+            "head": getattr(s, "me_head", None),
+            "len": getattr(s, "me_len", None),
+            "boosts": getattr(s, "me_boosts", None),
+            "last": getattr(s, "me_last_dir", None)
+        },
+        "opp": {
+            "head": getattr(s, "opp_head", None),
+            "len": getattr(s, "opp_len", None),
+            "boosts": getattr(s, "opp_boosts", None),
+            "last": getattr(s, "opp_last_dir", None)
+        },
 
-    The judge posts a dictionary with keys matching the Judge.send_state payload
-    (board, agent1_trail, agent2_trail, agent1_length, agent2_length, agent1_alive,
-    agent2_alive, agent1_boosts, agent2_boosts, turn_count).
-    """
-    with game_lock:
-        LAST_POSTED_STATE.clear()
-        LAST_POSTED_STATE.update(data)
+        "legal": legal,
+        "action": mv
+    }
+    _safe_jsonl(LOG_FILE, rec)
 
-        if "board" in data:
-            try:
-                GLOBAL_GAME.board.grid = data["board"]
-            except Exception:
-                pass
-
-        if "agent1_trail" in data:
-            GLOBAL_GAME.agent1.trail = deque(tuple(p) for p in data["agent1_trail"]) 
-        if "agent2_trail" in data:
-            GLOBAL_GAME.agent2.trail = deque(tuple(p) for p in data["agent2_trail"]) 
-        if "agent1_length" in data:
-            GLOBAL_GAME.agent1.length = int(data["agent1_length"])
-        if "agent2_length" in data:
-            GLOBAL_GAME.agent2.length = int(data["agent2_length"])
-        if "agent1_alive" in data:
-            GLOBAL_GAME.agent1.alive = bool(data["agent1_alive"])
-        if "agent2_alive" in data:
-            GLOBAL_GAME.agent2.alive = bool(data["agent2_alive"])
-        if "agent1_boosts" in data:
-            GLOBAL_GAME.agent1.boosts_remaining = int(data["agent1_boosts"])
-        if "agent2_boosts" in data:
-            GLOBAL_GAME.agent2.boosts_remaining = int(data["agent2_boosts"])
-        if "turn_count" in data:
-            GLOBAL_GAME.turns = int(data["turn_count"])
-
-
-@app.route("/send-state", methods=["POST"])
-def receive_state():
-    """Judge calls this to push the current game state to the agent server.
-
-    The agent should update its local representation and return 200.
-    """
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "no json body"}), 400
-    _update_local_game_from_post(data)
-    return jsonify({"status": "state received"}), 200
-
-
-@app.route("/send-move", methods=["GET"])
-def send_move():
-    """Judge calls this (GET) to request the agent's move for the current tick.
-
-    Query params the judge sends (optional): player_number, attempt_number,
-    random_moves_left, turn_count. Agents can use this to decide.
-    
-    Return format: {"move": "DIRECTION"} or {"move": "DIRECTION:BOOST"}
-    where DIRECTION is UP, DOWN, LEFT, or RIGHT
-    and :BOOST is optional to use a speed boost (move twice)
-    """
-    player_number = request.args.get("player_number", default=1, type=int)
-
-    with game_lock:
-        state = dict(LAST_POSTED_STATE)   
-        my_agent = GLOBAL_GAME.agent1 if player_number == 1 else GLOBAL_GAME.agent2
-        boosts_remaining = my_agent.boosts_remaining
-   
-    # -----------------your code here-------------------
-    # Simple example: always go RIGHT (replace this with your logic)
-    # To use a boost: move = "RIGHT:BOOST"
-    move = "RIGHT"
-    # Copy the last posted payload safely (outside the lock now)
-    payload = dict(state)
-
-    # Decide which side we are this tick
-    role = "agent1" if player_number == 1 else "agent2"
-
-    # Parse into our State object
-    s = parse_state(payload, role=role)
-
-    # Heuristic choice: "UP" / "DOWN" / "LEFT" / "RIGHT"
-    base_move = choose_by_heuristic(s)
-    move = maybe_apply_boost(s, base_move, threshold=8)
-
-    # Example: Use boost if available and it's late in the game
-    # turn_count = state.get("turn_count", 0)
-    # if boosts_remaining > 0 and turn_count > 50:
-    #     move = "RIGHT:BOOST"
-    # -----------------end code here--------------------
-
-    return jsonify({"move": move}), 200
-
-def choose_move(s):
-    """
-    Single entrypoint your agent uses each tick.
-    Heuristic-only first; BOOST policy can be toggled inside maybe_apply_boost.
-    """
-    base_move = choose_by_heuristic(s)          # "UP"/"DOWN"/"LEFT"/"RIGHT"
-    final_move = maybe_apply_boost(s, base_move)  # returns "DIR" or "DIR:BOOST"
-    return final_move
-
-
-@app.route("/end", methods=["POST"])
-def end_game():
-    """Judge notifies agent that the match finished and provides final state.
-
-    We update local state for record-keeping and return OK.
-    """
-    data = request.get_json()
-    if data:
-        _update_local_game_from_post(data)
-    return jsonify({"status": "acknowledged"}), 200
-
+    return jsonify({"move": mv}), 200
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5008"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
