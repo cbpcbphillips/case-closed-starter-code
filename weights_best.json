@@ -1,0 +1,18 @@
+{
+  "W_SPACE": 0.428,
+  "W_SPACE_REPLY": 0.238,
+  "W_BRANCH": 0.077,
+  "W_TUNNEL": -0.78,
+  "W_STRAIGHT": 0.05,
+  "W_CHOKE": -0.336,
+  "W_HEADON_WIN": 2.375,
+  "W_VORONOI": 0.833,
+  "W_VORONOI_RPLY": 0.292,
+  "W_ARTICULATE": -0.023,
+  "W_THREAT2": -0.25,
+  "EPS_NEAR_TIE": 3.0,
+  "BOOST_DELTA_T": 8,
+  "BEAM_K_ME": 3,
+  "BEAM_K_OPP": 3,
+  "MOVE_BUDGET_SEC": 0.01
+}

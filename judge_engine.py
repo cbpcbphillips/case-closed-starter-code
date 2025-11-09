@@ -213,7 +213,7 @@ class Judge:
 
 def main():
     print("Judge engine starting up, waiting for agents...")
-    time.sleep(5)
+    time.sleep(0.1)
 
     # Get agent URLs from environment variables
     PLAYER1_URL = os.getenv("PLAYER1_URL", "http://localhost:5008")
